@@ -4,6 +4,7 @@
 """Tests for watch management endpoints (RFC #2104)."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -195,6 +196,31 @@ async def test_not_found_404(client: httpx.AsyncClient):
     assert resp.status_code == 404
     resp = await client.patch("/api/v1/watches/no-such-task-id", json={"is_active": False})
     assert resp.status_code == 404
+
+
+async def test_failed_patch_keeps_last_persisted_watch_visible(app, watch_manager, monkeypatch):
+    task = await _seed(watch_manager, to_uri="viking://resources/test/failed-patch")
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        path = f"/api/v1/watches/{task.task_id}"
+        normal = await client.patch(path, json={"reason": "persisted"})
+        assert normal.status_code == 200
+
+        save_tasks = watch_manager._save_tasks
+        monkeypatch.setattr(
+            watch_manager, "_save_tasks", AsyncMock(side_effect=OSError("write failed"))
+        )
+        failed = await client.patch(path, json={"reason": "changed", "is_active": False})
+        assert failed.status_code == 500
+        live = await client.get(path)
+        assert live.status_code == 200
+        assert live.json()["result"]["reason"] == "persisted"
+        assert live.json()["result"]["is_active"] is True
+
+        monkeypatch.setattr(watch_manager, "_save_tasks", save_tasks)
+        retried = await client.patch(path, json={"reason": "retried"})
+        assert retried.status_code == 200
+        assert retried.json()["result"]["reason"] == "retried"
 
 
 async def test_patch_rejects_non_positive_watch_interval(client: httpx.AsyncClient, watch_manager):

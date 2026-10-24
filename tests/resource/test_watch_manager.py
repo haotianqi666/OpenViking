@@ -475,6 +475,61 @@ class TestWatchManager:
         assert updated.next_execution_time is None
 
     @pytest.mark.asyncio
+    async def test_update_task_restores_live_state_and_uri_index_on_save_failure(
+        self, watch_manager: WatchManager, mock_viking_fs: MockVikingFS, monkeypatch
+    ):
+        old_uri = "viking://resources/original"
+        new_uri = "viking://resources/changed"
+        task = await watch_manager.create_task(
+            path="/test/path", to_uri=old_uri, reason="persisted", watch_interval=30.0
+        )
+        original = task.model_dump(mode="python")
+        original_index = {key: set(ids) for key, ids in watch_manager._uri_to_task.items()}
+        write_file = mock_viking_fs.write_file
+        monkeypatch.setattr(
+            mock_viking_fs, "write_file", AsyncMock(side_effect=OSError("write failed"))
+        )
+
+        with pytest.raises(OSError, match="write failed"):
+            await watch_manager.update_task(
+                task.task_id,
+                TEST_ACCOUNT_ID,
+                TEST_USER_ID,
+                TEST_ROLE,
+                to_uri=new_uri,
+                reason="changed",
+                is_active=False,
+            )
+
+        assert task.model_dump(mode="python") == original
+        assert await watch_manager.get_task(task.task_id) is task
+        assert watch_manager._uri_to_task == original_index
+        assert (
+            await watch_manager.get_task_by_uri(old_uri, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE)
+            is task
+        )
+        assert (
+            await watch_manager.get_task_by_uri(new_uri, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE)
+            is None
+        )
+        reloaded = WatchManager(viking_fs=mock_viking_fs)
+        await reloaded.initialize()
+        reloaded_task = await reloaded.get_task(task.task_id)
+        assert reloaded_task is not None
+        assert reloaded_task.model_dump(mode="python") == original
+
+        monkeypatch.setattr(mock_viking_fs, "write_file", write_file)
+        updated = await watch_manager.update_task(
+            task.task_id,
+            TEST_ACCOUNT_ID,
+            TEST_USER_ID,
+            TEST_ROLE,
+            reason="retried",
+        )
+        assert updated.reason == "retried"
+        assert updated.to_uri == old_uri
+
+    @pytest.mark.asyncio
     async def test_update_task_not_found(self, watch_manager: WatchManager):
         """Test updating a non-existent task."""
         with pytest.raises(ValueError, match="not found"):
@@ -604,9 +659,7 @@ class TestWatchManager:
         assert tasks[0].is_active is True
 
     @pytest.mark.asyncio
-    async def test_get_all_tasks_admin_scoped_to_own_tasks(
-        self, watch_manager: WatchManager
-    ):
+    async def test_get_all_tasks_admin_scoped_to_own_tasks(self, watch_manager: WatchManager):
         """ADMIN is scoped to its own tasks; ROOT still sees the whole account."""
         await watch_manager.create_task(path="/test/alice1", user_id="alice")
         await watch_manager.create_task(path="/test/bob1", user_id="bob")
@@ -626,9 +679,7 @@ class TestWatchManager:
         assert len(alice_tasks) == 2
 
     @pytest.mark.asyncio
-    async def test_get_all_tasks_isolates_same_account_users(
-        self, watch_manager: WatchManager
-    ):
+    async def test_get_all_tasks_isolates_same_account_users(self, watch_manager: WatchManager):
         """Same account, different user_id → each caller sees only its own tasks."""
         await watch_manager.create_task(path="/test/alice1", user_id="alice")
         await watch_manager.create_task(path="/test/bob1", user_id="bob")

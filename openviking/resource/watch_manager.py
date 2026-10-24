@@ -617,7 +617,17 @@ class WatchManager:
                 resource=to_uri,
             )
 
+        original_task = task.model_copy(deep=True)
         old_to_uri = task.to_uri
+        index_keys = (
+            {(task.account_id, uri) for uri in (old_to_uri, to_uri) if uri}
+            if to_uri is not None
+            else set()
+        )
+        original_uri_index = {
+            key: self._uri_to_task[key].copy() if key in self._uri_to_task else None
+            for key in index_keys
+        }
         if path is not None:
             task.path = path
         if source_type is not None:
@@ -677,7 +687,18 @@ class WatchManager:
                 self._index_remove(task.account_id, old_to_uri, task_id)
             self._index_add(task.account_id, to_uri, task_id)
 
-        await self._save_tasks()
+        try:
+            await self._save_tasks()
+        except BaseException:
+            # The same task object may already be held by callers; restore it in place.
+            task.__dict__.update(original_task.__dict__)
+            task.__pydantic_fields_set__ = original_task.__pydantic_fields_set__.copy()
+            for key, task_ids in original_uri_index.items():
+                if task_ids is None:
+                    self._uri_to_task.pop(key, None)
+                else:
+                    self._uri_to_task[key] = task_ids
+            raise
         logger.info(f"[WatchManager] Updated task {task_id} by user {account_id}/{user_id}")
         return task
 
